@@ -1,5 +1,4 @@
-
-
+import os
 from typing import List, Tuple
 
 from deep_sort_reid.enums.tracker import TrackState
@@ -43,10 +42,78 @@ class Tracker():
         self.deleted_tracks: List[Track] = []
         self.next_tracker_id = 1
 
+        # Optional: centralized global ID via Redis INCR
+        self._redis_client = None
+        self._redis_key = os.getenv('REDIS_GLOBAL_TRACK_KEY', 'vision:global_track_id')
+        redis_url = os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/0')
+        try:
+            import redis  # type: ignore
+            self._redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+            # Test connection lightly
+            self._redis_client.ping()
+        except Exception:
+            # If Redis is unavailable, silently fall back to local counter
+            self._redis_client = None
+
     def __initiate_track(self, detection: Detection, track_id: int = -1):
+        # First try to find a match in the database
+        if detection.feature is not None and hasattr(self.cache_storage, 'search_topk'):
+            hits = self.cache_storage.search_topk(detection.feature, top_k=5)
+            if hits:
+                best_match = hits[0]
+                if best_match['distance'] > self.reid_similarity_score:
+                    new_track_id = best_match['track_id']
+                    state_mean, state_covariance = self.kf.initiate(
+                        from_xyxy_to_xyah(detection.coords))
+                    new_track = Track(
+                        state_mean,
+                        state_covariance,
+                        new_track_id,
+                        self.hits_until_confirm,
+                        self.max_since_update,
+                        detection.feature,
+                        detection.cls,
+                    )
+                    self.tracks.append(new_track)
+                    return
+
+        # If no match found or similarity too low, create new track
         new_track_id = self.next_tracker_id
         if track_id != -1:
             new_track_id = track_id
+        elif self._redis_client is not None:
+            # Allocate from Redis atomically; ensure uniqueness against Milvus if present
+            while True:
+                try:
+                    candidate = int(self._redis_client.incr(self._redis_key))
+                except Exception:
+                    # On Redis error, fall back to local counter
+                    candidate = new_track_id
+
+                if hasattr(self.cache_storage, '_collection'):
+                    expr = f'track_id == {candidate}'
+                    res = self.cache_storage._collection.query(
+                        expr=expr,
+                        output_fields=["track_id"],
+                        limit=1
+                    )
+                    if res:
+                        continue
+                new_track_id = candidate
+                break
+
+        # Ensure this ID is not already in use in any camera
+        if hasattr(self.cache_storage, '_collection'):
+            while True:
+                expr = f'track_id == {new_track_id}'
+                res = self.cache_storage._collection.query(
+                    expr=expr,
+                    output_fields=["track_id"],
+                    limit=1
+                )
+                if not res:
+                    break
+                new_track_id += 1
 
         state_mean, state_covariance = self.kf.initiate(
             from_xyxy_to_xyah(detection.coords))
@@ -61,7 +128,7 @@ class Tracker():
         )
 
         self.tracks.append(new_track)
-        self.next_tracker_id += 1
+        self.next_tracker_id = max(self.next_tracker_id + 1, new_track_id + 1)
 
     def predict(self):
         for track in self.tracks:
@@ -162,18 +229,56 @@ class Tracker():
             self.__initiate_track(detection)
 
     def __similarity_detection_tracks_match(self, detection: Detection, tracks: List[Track]):
-        highest_similarity_score = 0
+        # Prefer Milvus top-k search when available, then map hits to provided tracks.
+        if detection.feature is None or len(tracks) == 0:
+            return 0, -1
+
+        try:
+            # If Milvus-backed storage is present
+            if hasattr(self.cache_storage, 'search_topk'):
+                hits = self.cache_storage.search_topk(detection.feature, top_k=5)
+                if hits:
+                    track_id_to_local_idx = {t.track_id: idx for idx, t in enumerate(tracks)}
+                    metric_type = getattr(self.cache_storage, 'metric_type', 'IP')
+                    metric_type = metric_type.upper() if isinstance(metric_type, str) else 'IP'
+
+                    best_score = 0.0
+                    best_idx = -1
+                    for hit in hits:
+                        hit_tid = int(hit.get('track_id', -1))
+                        if hit_tid in track_id_to_local_idx:
+                            dist = float(hit.get('distance', 0.0))
+                            # In Milvus, for IP/COSINE the returned "distance" is actually similarity (higher is better).
+                            if metric_type in ('IP', 'COSINE'):
+                                score = dist
+                            else:
+                                # For L2, lower is better; convert to bounded similarity.
+                                score = 1.0 / (1.0 + dist)
+
+                            if score > best_score:
+                                best_score = score
+                                best_idx = track_id_to_local_idx[hit_tid]
+
+                    if best_idx != -1:
+                        return best_score, best_idx
+        except Exception:
+            # Fall back silently to in-memory comparison
+            pass
+
+        # Fallback: original in-memory mean feature cosine similarity
+        highest_similarity_score = 0.0
         highest_similarity_track_idx = -1
 
         for track_idx, track in enumerate(tracks):
             track_samples = None
 
-            if track.track_id in self.cache_storage.samples:
-                track_samples = self.cache_storage.get(track.track_id, 'mean')
+            if hasattr(self.cache_storage, 'samples') and track.track_id in self.cache_storage.samples:
+                try:
+                    track_samples = self.cache_storage.get(track.track_id, 'mean')
+                except Exception:
+                    track_samples = None
 
             if (track_samples is not None and detection.feature is not None):
-                # 1 - in order to transform it back to similarity from distance
-                # Should be setup to work with euclidean distance likewise
                 similarity_score = (1 - GatedMetric.cosine_distance(
                     track_samples, [detection.feature])).item()
 
